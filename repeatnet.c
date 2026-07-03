@@ -20,6 +20,7 @@ TODO :
 #include <time.h>
 #include <sys/time.h>
 #include <assert.h>
+#include <getopt.h>
 
 #define SEQ_LENGTH 150
 
@@ -56,6 +57,9 @@ typedef struct Component{
 
 void my_fgets(char *, int, FILE *);
 int readSingleFasta(FILE *, int);
+int readFastaRecord(FILE *, char **, char **);
+int readPairedFasta(FILE *, FILE *);
+void usage(char *);
 int hash(char *, int, int);
 void end2clone(char *, char *);
 void rcomp(char *, char *);
@@ -117,11 +121,8 @@ int WINORDER;
 
 int main(int argc, char **argv){
   
-  FILE *in;
+  FILE *in = NULL;
   int i,j,k;
-  int e1, e2, eboth;
-  FILE *graph;
-  FILE *matlog;
   FILE *winlog;
   FILE *namelog;
   int npairs;
@@ -130,19 +131,22 @@ int main(int argc, char **argv){
   char fname[SEQ_LENGTH];
   char fname2[SEQ_LENGTH];
   char namefile[SEQ_LENGTH];
+  char forwardfile[SEQ_LENGTH];
+  char reversefile[SEQ_LENGTH];
+  FILE *fwdfp = NULL;
+  FILE *revfp = NULL;
+  int PAIRED = 0;
+  char *encodearg = NULL;
   int hashtype;
   int hashtest=0;
   int mintime;
   int minhash;
-  float eweight;
   float ecut;
   int acut;
 
-  long winflagtime;
   long inserttime;
   long compacttime;
   long readtime;
-  long comparetime;
   long inittime;
   int mincollide=999999999;
   int mincolhash;
@@ -150,7 +154,6 @@ int main(int argc, char **argv){
   int LOADWIN = 0;
   int COMPARE = 0;
   int MERGE = 0;
-  char *decoded;
   int LOADMATRIX = 0;
   int DECODE = 0;
   int DUMPCLONES = 0;
@@ -161,95 +164,122 @@ int main(int argc, char **argv){
 
   int matrixcnt;
 
-  
   EDGEHIST = 0;
 
   collisions=0;
   
   WS = 12;
-  decoded = (char *)malloc(WS+1);
   ccut = 1;
   acut = 0;
 
-  if (argc < 2)
+  if (argc < 2){
+    usage(argv[0]);
     return 0;
+  }
 
   fname[0]=0;
   fname2[0]=0;
   namefile[0]=0;
+  forwardfile[0]=0;
+  reversefile[0]=0;
   hashtype=11;
   mintime=999999999;
 
-  winflagtime=0;
   inserttime=0;
   compacttime=0;
   readtime=0;
-  comparetime=0;
   inittime=0;
   ecut = 0.0;
-  
-  for (i=1;i<argc;i++){
-    if (!strcmp(argv[i], "-i"))
-      strcpy(fname, argv[i+1]);
-    else if (!strcmp(argv[i], "-h"))
-      hashtype=atoi(argv[i+1]);
-    else if (!strcmp(argv[i], "-t"))
-      hashtest=atoi(argv[i+1]);
-    else if (!strcmp(argv[i], "-e"))
-      ecut=atof(argv[i+1]);
-    else if (!strcmp(argv[i], "-a"))
-      acut=atoi(argv[i+1]);
-    else if (!strcmp(argv[i], "-c"))
-      ccut=atof(argv[i+1]);
-    else if (!strcmp(argv[i], "-m"))
-      MERGE = 1; 
-    else if (!strcmp(argv[i], "-loadwin")){
-      strcpy(fname, argv[i+1]);
-      LOADWIN=1;
-    }
-    else if (!strcmp(argv[i], "-loadnames")){
-      strcpy(namefile, argv[i+1]);
-      LOADNAMES=1;
-    }
-    else if (!strcmp(argv[i], "-loadmatrix")){
-      strcpy(fname, argv[i+1]);
-      LOADMATRIX=1;
-    }
-    else if (!strcmp(argv[i], "-getn")){
-      strcpy(fname2, argv[i+1]);
-    }
-    else if (!strcmp(argv[i], "-decode")){
-      strcpy(fname, argv[i+1]);
-      DECODE=1;
-    }
-    else if (!strcmp(argv[i], "-encode")){
-      printf("%d\n", encode_window(argv[i+1]));
-      return 1;
-    }
-    else if (!strcmp(argv[i], "-components"))
-      COMPONENTS = 1;
-    else if (!strcmp(argv[i], "-compare"))
-      COMPARE = 1;
-    else if (!strcmp(argv[i], "-edgehist"))
-      EDGEHIST = 1;
-    else if (!strcmp(argv[i], "-clones")){
-      DUMPCLONES = 1;
-      strcpy(fname2, argv[i+1]);
-    }
-    else if (!strcmp(argv[i], "-trim")){
-      TRIMWIN = 1;
-      strcpy(trimwinfile, argv[i+1]);
+
+  /* long-only option identifiers (values outside the printable-char range) */
+  enum {
+    OPT_LOADWIN = 256, OPT_LOADNAMES, OPT_LOADMATRIX, OPT_GETN,
+    OPT_DECODE, OPT_ENCODE, OPT_COMPONENTS, OPT_COMPARE,
+    OPT_EDGEHIST, OPT_CLONES, OPT_TRIM, OPT_HELP
+  };
+
+  static struct option long_opts[] = {
+    {"input",      required_argument, 0, 'i'},
+    {"forward",    required_argument, 0, 'f'},
+    {"reverse",    required_argument, 0, 'r'},
+    {"hash",       required_argument, 0, 'H'},
+    {"hashtest",   required_argument, 0, 't'},
+    {"ecut",       required_argument, 0, 'e'},
+    {"acut",       required_argument, 0, 'a'},
+    {"ccut",       required_argument, 0, 'c'},
+    {"merge",      no_argument,       0, 'm'},
+    {"loadwin",    required_argument, 0, OPT_LOADWIN},
+    {"loadnames",  required_argument, 0, OPT_LOADNAMES},
+    {"loadmatrix", required_argument, 0, OPT_LOADMATRIX},
+    {"getn",       required_argument, 0, OPT_GETN},
+    {"decode",     required_argument, 0, OPT_DECODE},
+    {"encode",     required_argument, 0, OPT_ENCODE},
+    {"components", no_argument,       0, OPT_COMPONENTS},
+    {"compare",    no_argument,       0, OPT_COMPARE},
+    {"edgehist",   no_argument,       0, OPT_EDGEHIST},
+    {"clones",     required_argument, 0, OPT_CLONES},
+    {"trim",       required_argument, 0, OPT_TRIM},
+    {"help",       no_argument,       0, OPT_HELP},
+    {0, 0, 0, 0}
+  };
+
+  int opt;
+  while ((opt = getopt_long(argc, argv, "i:f:r:H:t:e:a:c:m",
+			    long_opts, NULL)) != -1){
+    switch (opt){
+    case 'i': strcpy(fname, optarg); break;
+    case 'f': strcpy(forwardfile, optarg); break;
+    case 'r': strcpy(reversefile, optarg); break;
+    case 'H': hashtype = atoi(optarg); break;
+    case 't': hashtest = atoi(optarg); break;
+    case 'e': ecut = atof(optarg); break;
+    case 'a': acut = atoi(optarg); break;
+    case 'c': ccut = atof(optarg); break;
+    case 'm': MERGE = 1; break;
+    case OPT_LOADWIN:    strcpy(fname, optarg); LOADWIN = 1; break;
+    case OPT_LOADNAMES:  strcpy(namefile, optarg); LOADNAMES = 1; break;
+    case OPT_LOADMATRIX: strcpy(fname, optarg); LOADMATRIX = 1; break;
+    case OPT_GETN:       strcpy(fname2, optarg); break;
+    case OPT_DECODE:     strcpy(fname, optarg); DECODE = 1; break;
+    case OPT_ENCODE:     encodearg = optarg; break;
+    case OPT_COMPONENTS: COMPONENTS = 1; break;
+    case OPT_COMPARE:    COMPARE = 1; break;
+    case OPT_EDGEHIST:   EDGEHIST = 1; break;
+    case OPT_CLONES:     DUMPCLONES = 1; strcpy(fname2, optarg); break;
+    case OPT_TRIM:       TRIMWIN = 1; strcpy(trimwinfile, optarg); break;
+    case OPT_HELP:       usage(argv[0]); return 0;
+    case '?':            usage(argv[0]); return 1;
     }
   }
-  
-  
-  if(fname[0]==0){
-    fprintf(stderr, "input file?\n");
-    return 0;
+
+  /* --encode just converts a k-mer string to its integer code and exits. */
+  if (encodearg != NULL){
+    printf("%d\n", encode_window(encodearg));
+    return 1;
   }
 
+  /* Two-file (separate forward/reverse) input requires both files. */
+  if (forwardfile[0] || reversefile[0]){
+    if (!forwardfile[0] || !reversefile[0]){
+      fprintf(stderr, "Both --forward and --reverse are required for two-file input.\n");
+      return 0;
+    }
+    PAIRED = 1;
+  }
 
-  in = myfopen(fname,"r");
+  if (PAIRED){
+    fwdfp = myfopen(forwardfile, "r");
+    revfp = myfopen(reversefile, "r");
+    /* base the output file names on the forward reads file */
+    strcpy(fname, forwardfile);
+  }
+  else{
+    if (fname[0] == 0){
+      fprintf(stderr, "input file?\n");
+      return 0;
+    }
+    in = myfopen(fname, "r");
+  }
 
 
   if (LOADNAMES){
@@ -284,8 +314,8 @@ int main(int argc, char **argv){
       rewind(in);
       for (j=0;j<nseq;j++)
 	free(names[j]);
-      free(names), 
-      gettimeofday(&start, &tz);  
+      free(names);
+      gettimeofday(&start, &tz);
       collisions = 0;
       nseq = hashTest(in, i);
       gettimeofday(&end, &tz);
@@ -304,8 +334,11 @@ int main(int argc, char **argv){
     return 0;
   }
 
-  gettimeofday(&start, &tz);  
-  nseq = readSingleFasta(in, hashtype);
+  gettimeofday(&start, &tz);
+  if (PAIRED)
+    nseq = readPairedFasta(fwdfp, revfp);
+  else
+    nseq = readSingleFasta(in, hashtype);
   gettimeofday(&end, &tz);
   readtime = ((int)(end.tv_sec*1000000+end.tv_usec)-(int)(start.tv_sec*1000000+start.tv_usec));
 	
@@ -344,7 +377,7 @@ int main(int argc, char **argv){
   fprintf(stderr, "Remaining pairs: %d\n", npairs);
   wincnt = pow(4, WS);
   
-  fprintf(stdout, "Number of windows:%ld\n", wincnt);
+  fprintf(stdout, "Number of windows:%d\n", wincnt);
 
   winlocs = (struct wpair **)malloc(sizeof(struct wpair *)*wincnt);
   windowflag = (int *) malloc(sizeof(int)*wincnt);
@@ -407,31 +440,17 @@ int main(int argc, char **argv){
     dumpwins(winlog, i);
     fprintf(dumphist, "%d\t%d\n", i, windowcnt[i]);
   }
-  return 1;
-
-  // THIS FOR-LOOP can be written with pthread  producer/consumer as well
-  gettimeofday(&start, &tz);  
-
-  compare(fname, hashtype, ecut, ccut, acut, MERGE);
-
-  gettimeofday(&end, &tz);
-  comparetime += ((int)(end.tv_sec)-(int)(start.tv_sec));
-  
+  fclose(winlog);
+  fclose(dumphist);
   fprintf(stderr, "\n");
-  
-
-
 
   fprintf(stdout,"\n-------------------------------------\n");
   fprintf(stdout,"\tread time:\t%ld usec\n", readtime);
   fprintf(stdout,"\tcompact time:\t%ld usec\n", compacttime);
   fprintf(stdout,"\tinit time:\t%ld usec\n", inittime);
   fprintf(stdout,"\tinsert time:\t%ld usec\n", inserttime);
-  fprintf(stdout,"\twinflag time:\t%ld usec\n", winflagtime);
-  fprintf(stdout,"\tcompare time:\t%ld sec\n", comparetime);
   fprintf(stdout,"-------------------------------------\n");
 
-  
   return 1;
 
 }
@@ -439,7 +458,6 @@ int main(int argc, char **argv){
 
 int hashTest(FILE *fastaFile, int hashtype){
   int cnt;
-  char myname[SEQ_LENGTH];
   char myclone[SEQ_LENGTH];
   int index;
   char dummy[SEQ_LENGTH];
@@ -451,12 +469,12 @@ int hashTest(FILE *fastaFile, int hashtype){
   while(fscanf(fastaFile, "%s", dummy)>0)
     cnt++;
 
-  names = (char **) malloc((cnt) * sizeof(char *));
+  names = (char **) calloc(cnt, sizeof(char *));
   rewind(fastaFile);
   i=0;
   while(fscanf(fastaFile, "%s", dummy)>0){
     end2clone(myclone, dummy);
-    index = hash(myclone , cnt, hashtype); // hope it works    
+    index = hash(myclone , cnt, hashtype); // hope it works
     i++;
     fprintf(stderr, "\r%d\tof\t%d", i,cnt);
     if (names[index] == NULL)
@@ -465,18 +483,18 @@ int hashTest(FILE *fastaFile, int hashtype){
   }
 
   fprintf(stderr, "\n");
+  return cnt;
 }
 
 int readSingleFasta(FILE *fastaFile, int hashtype){
   int cnt;
-  char ch; 
-  int i,j;
+  char ch;
+  int i;
   int seqcnt=0, seqlen=0;
   int clonecnt;
   int maxnamelen;
   int maxlen;
   char dummy[SEQ_LENGTH];
-  char str[SEQ_LENGTH];
   char myname[SEQ_LENGTH];
   char myclone[SEQ_LENGTH];
   int index;
@@ -641,6 +659,159 @@ int readSingleFasta(FILE *fastaFile, int hashtype){
 
 }
 
+/* Read the next FASTA record from f.
+   On success returns 1 and stores freshly malloc'd strings in *name_out
+   (header line, without the leading '>') and *seq_out (sequence with all
+   whitespace stripped). Returns 0 at end of file. The caller frees both. */
+int readFastaRecord(FILE *f, char **name_out, char **seq_out){
+  int c;
+  int ncap = 0, nlen = 0;
+  int scap = 0, slen = 0;
+  char *name = NULL;
+  char *seq = NULL;
+
+  /* find the start of the next record */
+  while ((c = fgetc(f)) != EOF && c != '>')
+    ;
+  if (c == EOF)
+    return 0;
+
+  /* header line (up to end of line) */
+  while ((c = fgetc(f)) != EOF && c != '\n' && c != '\r'){
+    if (nlen + 1 >= ncap){
+      ncap = ncap ? ncap * 2 : 128;
+      name = (char *) realloc(name, ncap);
+    }
+    name[nlen++] = c;
+  }
+  if (name == NULL)
+    name = (char *) malloc(1);
+  name[nlen] = 0;
+
+  /* sequence: everything up to the next '>' or EOF, whitespace removed */
+  while ((c = fgetc(f)) != EOF){
+    if (c == '>'){
+      ungetc(c, f);
+      break;
+    }
+    if (isspace(c))
+      continue;
+    if (slen + 1 >= scap){
+      scap = scap ? scap * 2 : 256;
+      seq = (char *) realloc(seq, scap);
+    }
+    seq[slen++] = c;
+  }
+  if (seq == NULL)
+    seq = (char *) malloc(1);
+  seq[slen] = 0;
+
+  *name_out = name;
+  *seq_out = seq;
+  return 1;
+}
+
+/* Two-file input: forward reads in one file, reverse reads in another, paired
+   by position (the i-th record of each file form a forward/reverse pair, so no
+   name matching is needed). Fills the global forwards/reverses/names arrays and
+   returns the number of pairs. Reverse reads are reverse-complemented, matching
+   how readSingleFasta stores them. */
+int readPairedFasta(FILE *fwd, FILE *rev){
+  int cap = 0, n = 0;
+  char *fwdname, *fwdseq;
+  char *revname, *revseq;
+
+  forwards = NULL;
+  reverses = NULL;
+  names = NULL;
+
+  fprintf(stderr, "Reading paired forward/reverse sequences.\n");
+
+  while (readFastaRecord(fwd, &fwdname, &fwdseq)){
+    char *clone;
+    char *revcomp;
+
+    if (!readFastaRecord(rev, &revname, &revseq)){
+      fprintf(stderr,
+	      "Warning: forward file has more reads than reverse; extra forward reads ignored.\n");
+      free(fwdname); free(fwdseq);
+      break;
+    }
+
+    if (n >= cap){
+      cap = cap ? cap * 2 : 1024;
+      forwards = (char **) realloc(forwards, cap * sizeof(char *));
+      reverses = (char **) realloc(reverses, cap * sizeof(char *));
+      names    = (char **) realloc(names,    cap * sizeof(char *));
+    }
+
+    /* forward read stored as-is */
+    forwards[n] = fwdseq;
+
+    /* reverse read stored reverse-complemented */
+    revcomp = (char *) malloc(strlen(revseq) + 1);
+    rcomp(revseq, revcomp);
+    reverses[n] = revcomp;
+    free(revseq);
+
+    /* clone identifier for the .names file (strip any FORWARD/REVERSE tag) */
+    clone = (char *) malloc(strlen(fwdname) + 1);
+    end2clone(clone, fwdname);
+    names[n] = clone;
+
+    free(fwdname);
+    free(revname);
+    n++;
+
+    fprintf(stderr, "\r%d pairs", n);
+  }
+
+  /* drain any leftover reverse reads just to report the mismatch */
+  if (readFastaRecord(rev, &revname, &revseq)){
+    fprintf(stderr,
+	    "\nWarning: reverse file has more reads than forward; extra reverse reads ignored.\n");
+    free(revname); free(revseq);
+  }
+
+  fprintf(stderr, "\n[OK] %d forward/reverse pairs read.\n", n);
+  return n;
+}
+
+void usage(char *prog){
+  fprintf(stderr,
+"RepeatNet: an ab initio centromeric sequence detection algorithm\n"
+"\n"
+"Usage: %s [options]\n"
+"\n"
+"Input (choose one):\n"
+"  -i, --input FILE         interleaved FASTA (forward/reverse reads in one file)\n"
+"  -f, --forward FILE       forward reads FASTA (use together with --reverse)\n"
+"  -r, --reverse FILE       reverse reads FASTA (paired by position with --forward)\n"
+"\n"
+"Parameters:\n"
+"  -H, --hash N             hash function type (default 11)\n"
+"  -e, --ecut F             edge-weight cutoff (default 0.0)\n"
+"  -a, --acut N             absolute co-occurrence cutoff (0 = use --ecut)\n"
+"  -c, --ccut N             vertex count cutoff (default 1)\n"
+"  -m, --merge              merge reverse-complement k-mers before comparing\n"
+"  -t, --hashtest N         benchmark hash functions 3..N-1 and exit\n"
+"\n"
+"Pipeline stages:\n"
+"      --loadwin FILE       load a .winlog produced by an earlier run\n"
+"      --loadnames FILE     load a .names file\n"
+"      --loadmatrix FILE    load a binary .matrix file\n"
+"      --getn FILE          list of vertices whose neighbors to report (with --loadmatrix)\n"
+"      --compare            build the co-occurrence graph/matrix\n"
+"      --components         split a loaded matrix into connected components\n"
+"      --clones FILE        dump clone names for the vertices listed in FILE\n"
+"      --trim FILE          drop the windows listed in FILE from a loaded .winlog\n"
+"      --edgehist           also write an edge-weight histogram\n"
+"      --decode FILE        decode integer window codes back to k-mer strings\n"
+"      --encode KMER        print the integer code for a k-mer and exit\n"
+"      --help               show this message\n",
+	  prog);
+}
+
 void my_fgets(char *str, int length, FILE *in){
   char ch;
   int i=0;
@@ -662,60 +833,59 @@ void my_fgets(char *str, int length, FILE *in){
 
 int hash(char *this_name, int nseq, int type){
   int i;
+  int len = strlen(this_name);
   unsigned long sum;
-  //int prime=3160979;
   int index;
   unsigned int a,b;
-  int doescollide=0;
 
   sum = 0;
   a=378551;
   b=63689;
-  
+
   if (type == 0){
-    for (i=0;i<strlen(this_name);i++){
+    for (i=0;i<len;i++){
       if (this_name[i]!=' ')
 	sum += i*this_name[i]+i;
     }
   }
   else if (type == 1){
-    for (i=0;i<strlen(this_name);i++){
+    for (i=0;i<len;i++){
       if (this_name[i]!=' ')
 	sum += this_name[i];
     }  
   }
   else if (type == 2){
-    for (i=0;i<strlen(this_name);i++){
+    for (i=0;i<len;i++){
       if (this_name[i]!=' ')
 	sum += i*this_name[i];
     }
   }
   else if (type == 3){
-    for (i=0;i<strlen(this_name);i++){
+    for (i=0;i<len;i++){
       if (this_name[i]!=' ')
 	sum += this_name[i] * pow(7,i); // rabin-karp style
     }
   }
   else if (type == 4){
-    for (i=0;i<strlen(this_name);i++){
+    for (i=0;i<len;i++){
       if (this_name[i]!=' ')
 	sum += this_name[i] * pow(11,i); // rabin-karp style, part 2
     }
   }
   else if (type == 5){
-   for (i=0;i<strlen(this_name);i++){
+   for (i=0;i<len;i++){
      sum += sum*a + this_name[i];
      a = a*b; //RShash
    }
   }
   else if (type == 6){
     sum=1315423911;
-   for (i=0;i<strlen(this_name);i++){
+   for (i=0;i<len;i++){
      sum ^= ((sum<<5) + this_name[i] + (sum>>2)); // JShash
    }
   }
   else if (type == 7){
-   for (i=0;i<strlen(this_name);i++){
+   for (i=0;i<len;i++){
      sum = (sum << 4) + this_name[i];
      if ((a = sum & 0XFF0000000L) != 0)
        sum ^= a>>24;
@@ -724,40 +894,40 @@ int hash(char *this_name, int nseq, int type){
   }
   else if (type == 8){
     a=131;
-    for (i=0;i<strlen(this_name);i++){
+    for (i=0;i<len;i++){
       sum=(sum*a)+this_name[i]; //bkdrhash
     }
   }
   else if (type == 9){
-    for (i=0;i<strlen(this_name);i++){
+    for (i=0;i<len;i++){
       sum = this_name[i] + (sum<<6) + (sum<<16) - sum; //sdbmhash
     }
   }
   else if (type == 10){
-    for (i=0;i<strlen(this_name);i++){
+    for (i=0;i<len;i++){
       sum = ((sum<<5) + sum) + this_name[i]; // djb
     }
     
   }
   else if (type == 11){
-    for (i=0;i<strlen(this_name);i++){
+    for (i=0;i<len;i++){
       sum=((sum<<5)^(sum>>27))^this_name[i]; //DEK
     }
   }
   else if (type == 12){
-    for (i=0;i<strlen(this_name);i++){
+    for (i=0;i<len;i++){
       sum = sum<<7 ^ this_name[i];
     }
   }
   else if (type == 13){
-    for (i=0;i<strlen(this_name);i++){
+    for (i=0;i<len;i++){
       a=0x811C9DC5;
       sum*=a;
       sum^=this_name[i]; // fnv
     }
   }
   else if (type == 14){
-    for (i=0;i<strlen(this_name);i++){
+    for (i=0;i<len;i++){
       sum ^= ((i&1) == 0)?((sum<<7)^this_name[i]^(sum>>3)):
 	(~((sum<<11)^this_name[i]^(sum>>5))); //ap
     }
@@ -768,15 +938,11 @@ int hash(char *this_name, int nseq, int type){
 
   
   while (names[index] != NULL && strcmp(names[index], this_name)){
-    //  fprintf(stderr, "looking %s\n", this_name);
-    doescollide=1;
     collisions++;
     index++;
     if (index == nseq)
       index = 0;
   }
-  
-  //if (doescollide) collisions++;
 
   return index;
 
@@ -810,9 +976,9 @@ void end2clone(char *clone, char *end){
     i++;
     // find the '.' after REVERSE/FORWARD
     while (end[i]!='.') i++;
-    // don't skip that 
+    // don't skip that
     // copy the rest
-    while(i<strlen(end))
+    while(i<len)
       clone[j++] = end[i++];
     // terminate
     clone[j] = 0;
@@ -821,7 +987,7 @@ void end2clone(char *clone, char *end){
 
 
   j=0;
-  for (i=0; i<strlen(end); i++){
+  for (i=0; i<len; i++){
     if ((end[i] != 'F' && end[i] != 'R') || flag){
       clone[j++] = end[i];  
     }
@@ -893,48 +1059,8 @@ int isReverse(char *name){
 }
 
 int encode_window(char *window){
-
+  /* 2-bit encoding: A:0, C:1, G:2, T:3, packed MSB-first. */
   return encode_window2(window);
-
-
-  int len = strlen(window);
-  int i;
-  int ret = 0;
-  int this;
-  // OLD:: NOTE: this actually reverses the window
-  // 000..00: AAA..AA
-  // 111..11: TTT..TT
-  // 000..11: TAAA...AA
-
-
-  // FIXED AS: 
-  // 000..00: AAA..AA
-  // 111..11: TTT..TT
-  // 000..11: AAA..AT
-  // 110..00: TAA..AA
-  // THE FIRST BIT IS 2*WS
-  // ANY BITS BETWEEN 32-2WS-1 are 0
-
-
-  //A:0, C:1, G:2, T:3
-  for (i=0;i<len;i++){
-    switch(toupper(window[i])){
-    case 'A':
-      this = 0;
-      break;
-    case 'C':
-      this = 1 * pow(4, (WS-i-1));
-      break;
-    case 'G':
-      this = 2 * pow(4, (WS-i-1));
-      break;
-    case 'T':
-      this = 3 * pow(4, (WS-i-1));
-      break;
-    }
-    ret += this;
-  }
-  return ret;
 }
 
 int encode_window2(char *window){
@@ -961,39 +1087,13 @@ int encode_window2(char *window){
 }
 
 int revcomp_encoded(unsigned int code){
-  unsigned int n, this;
-  int totalbits = sizeof(int) * 8;
-  int shiftright;
-  int shiftleft;
-  int i;
+  /* Decode to text, reverse-complement, then re-encode. */
   char thiswin[20];
   char reverse[20];
 
   decode_window(code, thiswin);
   rcomp(thiswin, reverse);
   return encode_window2(reverse);
-
-
-  n = 0;
-  this = code;
-
-  for (i=0;i<WS;i++){
-    shiftright = 2*(WS-i-1);
-    this = this >> shiftright;
-    this = ~this;
-
-    shiftleft = totalbits - 2;
-    this = this << shiftleft;
-
-    shiftright = totalbits - 2*(i+1);
-    this = this >> shiftright;
-
-    n = n | this;
-  }
-
-
-  return n;
-
 }
 
 
@@ -1076,8 +1176,10 @@ void do_end(int index, int orient){
   else
     flen = strlen(reverses[index]);
 
-  window = (char *) malloc(sizeof(char)*WS);
-  
+  /* getWindow writes WS characters plus a terminating '\0' at window[WS],
+     so the buffer needs WS+1 bytes. */
+  window = (char *) malloc(sizeof(char)*(WS+1));
+
   i=0;
   if (orient == FORWARD){
     while (i<flen-WS+1){
@@ -1208,7 +1310,6 @@ void compare_wloc(struct wpair *wloc1, struct wpair *wloc2, int *eboth){
 
 void dumpwins(FILE *winlog, int index){
   struct wpair *w1;
-  int separator=-1;
   w1 = winlocs[index];
 
   fwrite(&index, sizeof(int), 1, winlog);
@@ -1227,7 +1328,6 @@ void loadwins(FILE *winlog){
   char ch;
   int i;
   int status;
-  int prev;
 
   fscanf(winlog, "%d", &WS);
   // pass newline
@@ -1297,8 +1397,10 @@ void decode_window(int code, char *window){
   int totalbits = sizeof(int)*8;
   for (i=0;i<WS;i++){
     shiftleft = totalbits - 2*WS + 2*i;
-    shiftright = totalbits - 2; 
-    left = code << shiftleft;
+    shiftright = totalbits - 2;
+    /* shift on an unsigned value: shifting into the sign bit of a signed
+       int is undefined behavior. */
+    left = (unsigned int)code << shiftleft;
     right = left >> shiftright;
     window[i] = reverseindex(right);
   }
@@ -1362,67 +1464,45 @@ void compare(char *fname, int hashtype, float ecut, int ccut, int acut, int merg
   fprintf(stdout, "Comparing...");
   fflush(stdout);
 
-  for(i=0;i<wincnt;i++){
-    /*
-    if (winlocs[i]==NULL)
-    continue; */
-    if (windowcnt[i]<ccut)
-      continue;
-    //dumpwins(winlog, i);
+  /* Only windows with an occupied location list and count >= ccut can
+     produce an edge, and there are far fewer of those than the 4^WS slots.
+     Collect them once (in ascending index order, so i<j is preserved) and
+     compare only those pairs instead of scanning the whole space. */
+  int *active = (int *) malloc(sizeof(int) * wincnt);
+  int nactive = 0;
+  for (i=0;i<wincnt;i++)
+    if (windowcnt[i] >= ccut && winlocs[i] != NULL)
+      active[nactive++] = i;
 
-    for (j=i+1;j<wincnt;j++){
-      if (windowcnt[j]<ccut)
-	continue;
-      if (winlocs[j]==NULL)
-	continue;
-      
-      //printf("running %d and %d\n", i, j);
+  int ai, aj;
+  for (ai=0; ai<nactive; ai++){
+    i = active[ai];
+    for (aj=ai+1; aj<nactive; aj++){
+      j = active[aj];
 
       compare_wloc(winlocs[i], winlocs[j], &eboth);
-
-      //printf("%d\t%d\t%d\n", i,j,eboth);
 
       e1 = windowcnt[i];
       e2 = windowcnt[j];
 
-      eweight=2*(float)eboth/(float)(e1+e2);
+      eweight = 2*(float)eboth/(float)(e1+e2);
 
       if (acut!=0) eweight=eboth;
 
       if (eweight>thiscut){
 	// if ecut=0.0, then return any overlap (1)
-	/* TODO:
-	   
-	dump the matrix representation in binary format
-	done; it may be useful to dump all e1,e2,eb values as well
-	didn't decide yet.
-	..
-	and, oh, yes, make this thing faster. even the linked list insertion
-	is slow; a huge portion of the slowness is probably because of windowflags
-	...
-	try producer/consumer pthreads 
-	..
-	parameterization, WS, input, etc. in progress
-	
-	dump winloc array in binary format
-	-> done, but not optimal :) 
-	-- hash is in good condition now, types 4 to 14 all look good and have similar speeds
-	 */
-
-
 	fprintf(graph, "\t%d -- %d;\n", i, j);
-	//fprintf(matlog, "%d\t%d\t%f\n",i,j,(2*(float)eboth/(float)(e1+e2)));
-	//eweight=2*(float)eboth/(float)(e1+e2);
 	fwrite(&i,sizeof(int),1,matlog);
 	fwrite(&j,sizeof(int),1,matlog);
-	//fwrite(&eweight,sizeof(float),1,matlog);
 	fwrite(&eboth,sizeof(int),1,matlog);
 	dumped++;
 	if(EDGEHIST)
 	  fprintf(edgelog, "%d\n", eboth);
       }
-    }    
+    }
   }
+
+  free(active);
 
   fprintf(graph, "}\n");
   fclose(graph);
@@ -1432,10 +1512,12 @@ void compare(char *fname, int hashtype, float ecut, int ccut, int acut, int merg
   fwrite(&dumped, sizeof(int), 1 , matlog);
 
   fclose(matlog);
+  if (EDGEHIST)
+    fclose(edgelog);
   printf("matsize: %d\nWS: %d\n", dumped, WS);
 
   fprintf(stdout, "\nCompared...\n");
-  
+
 }
 
 void compactwins(void){
@@ -1461,18 +1543,6 @@ void compactwins(void){
   }
   
   fprintf(stdout, "\nMerged.\n");
-
-  struct wpair *w;
-
-  /*
-  w = winlocs[0];
-  while (w!=NULL){
-    printf("%d\n", w->id);
-    w=w->next;
-  }
-  exit(0);
-  */
-
 }
 
 void merge(int i, int rci){
@@ -1598,7 +1668,6 @@ void freewins(struct wpair *w){
 }
 
 int loadMatrix(char *fname, char *fname2){
-  char ch;
   FILE *matlog;
   FILE *neighbor;
   FILE *nfile;
@@ -1689,10 +1758,6 @@ int loadMatrix(char *fname, char *fname2){
 
   return dumped;
 
-}
-
-void mds(){
-  // find maximum density subgraph
 }
 
 FILE *myfopen(char *fname, char *mode){
@@ -1855,7 +1920,8 @@ void connComp(int matrixcnt, int wincnt){
     newInterNode -> v1 = v1;
     newInterNode -> v2 = v2;
     newInterNode -> w = w;
-    
+    newInterNode -> next = NULL;
+
     //if both sequences are not clustered, put them in a new cluster
     if (seqComp[v1] == UNCLUSTERED && seqComp[v2] == UNCLUSTERED) {
       numComponents++;
@@ -1864,7 +1930,8 @@ void connComp(int matrixcnt, int wincnt){
       components[numComponents] = newNode;
       newNode2 = (struct listNode*) malloc(sizeof(struct listNode));
       newNode2 -> seqId = v2;
-      components[numComponents] -> next = newNode2;      
+      newNode2 -> next = NULL;
+      components[numComponents] -> next = newNode2;
       lastNodes[numComponents] = newNode2;
       seqComp[v1] = numComponents;
       seqComp[v2] = numComponents;  
@@ -1879,6 +1946,7 @@ void connComp(int matrixcnt, int wincnt){
       seq1Comp = seqComp[v1];
       newNode = (struct listNode*) malloc(sizeof(struct listNode));
       newNode -> seqId = v2;
+      newNode -> next = NULL;
       lastNodes[seq1Comp] -> next = newNode;
       lastNodes[seq1Comp] = newNode;
       seqComp[v2] = seq1Comp;
@@ -1892,8 +1960,9 @@ void connComp(int matrixcnt, int wincnt){
       seq2Comp = seqComp[v2];
       newNode = (struct listNode*) malloc(sizeof(struct listNode));
       newNode -> seqId = v1;
-      lastNodes[seq1Comp] -> next = newNode;
-      lastNodes[seq1Comp] = newNode;
+      newNode -> next = NULL;
+      lastNodes[seq2Comp] -> next = newNode;
+      lastNodes[seq2Comp] = newNode;
       seqComp[v1] = seq2Comp;
       //arrange interaction nodes
       lastInterNodes[seq2Comp] -> next = newInterNode;
