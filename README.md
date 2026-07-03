@@ -17,7 +17,10 @@ Compilation:
 
 Run `repeatnet --help` for the full list of options.
 
-Input: FASTA format only. Two input layouts are supported.
+Input: FASTA or FASTQ. The format is auto-detected from the first
+character of the file ('>' = FASTA, '@' = FASTQ), so no flag is needed and
+the two can even be mixed in the two-file mode below. Two input layouts
+are supported.
 
 1) Interleaved (single file), with -i / --input
 ------------------------------------------------

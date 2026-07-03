@@ -24,6 +24,9 @@ TODO :
 
 #define SEQ_LENGTH 150
 
+#define FASTA_FMT 0
+#define FASTQ_FMT 1
+
 #define FORWARD 0
 #define REVERSE 1
 
@@ -57,8 +60,10 @@ typedef struct Component{
 
 void my_fgets(char *, int, FILE *);
 int readSingleFasta(FILE *, int);
-int readFastaRecord(FILE *, char **, char **);
-int readPairedFasta(FILE *, FILE *);
+int detectFormat(FILE *);
+int readSeqRecord(FILE *, int, char **, char **);
+int readInterleavedFastq(FILE *, int);
+int readPaired(FILE *, FILE *);
 void usage(char *);
 int hash(char *, int, int);
 void end2clone(char *, char *);
@@ -336,7 +341,9 @@ int main(int argc, char **argv){
 
   gettimeofday(&start, &tz);
   if (PAIRED)
-    nseq = readPairedFasta(fwdfp, revfp);
+    nseq = readPaired(fwdfp, revfp);
+  else if (detectFormat(in) == FASTQ_FMT)
+    nseq = readInterleavedFastq(in, hashtype);
   else
     nseq = readSingleFasta(in, hashtype);
   gettimeofday(&end, &tz);
@@ -663,15 +670,41 @@ int readSingleFasta(FILE *fastaFile, int hashtype){
    On success returns 1 and stores freshly malloc'd strings in *name_out
    (header line, without the leading '>') and *seq_out (sequence with all
    whitespace stripped). Returns 0 at end of file. The caller frees both. */
-int readFastaRecord(FILE *f, char **name_out, char **seq_out){
+/* Peek at the first non-whitespace character to decide the file format:
+   '>' means FASTA, '@' means FASTQ. The character is pushed back so the
+   record readers see an intact stream. */
+int detectFormat(FILE *f){
+  int c;
+  while ((c = fgetc(f)) != EOF && isspace(c))
+    ;
+  if (c != EOF)
+    ungetc(c, f);
+  if (c == '>')
+    return FASTA_FMT;
+  if (c == '@')
+    return FASTQ_FMT;
+  fprintf(stderr, "Unrecognized input format: expected FASTA ('>') or FASTQ ('@').\n");
+  exit(1);
+}
+
+/* Read the next sequence record (FASTA or FASTQ) from f.
+   On success returns 1 and stores freshly malloc'd strings in *name_out
+   (header line, without the leading '>'/'@') and *seq_out (sequence with all
+   whitespace stripped). Returns 0 at end of file. The caller frees both.
+   For FASTQ, the '+' separator and the quality line are consumed and
+   discarded; exactly as many quality characters as sequence characters are
+   read, so quality symbols such as '@' or '+' can never be mistaken for the
+   start of the next record. */
+int readSeqRecord(FILE *f, int format, char **name_out, char **seq_out){
   int c;
   int ncap = 0, nlen = 0;
   int scap = 0, slen = 0;
   char *name = NULL;
   char *seq = NULL;
+  char header = (format == FASTQ_FMT) ? '@' : '>';
 
   /* find the start of the next record */
-  while ((c = fgetc(f)) != EOF && c != '>')
+  while ((c = fgetc(f)) != EOF && c != header)
     ;
   if (c == EOF)
     return 0;
@@ -688,20 +721,51 @@ int readFastaRecord(FILE *f, char **name_out, char **seq_out){
     name = (char *) malloc(1);
   name[nlen] = 0;
 
-  /* sequence: everything up to the next '>' or EOF, whitespace removed */
-  while ((c = fgetc(f)) != EOF){
-    if (c == '>'){
-      ungetc(c, f);
-      break;
+  if (format == FASTQ_FMT){
+    /* sequence: lines until one that starts with the '+' separator */
+    int atlinestart = 1;
+    while ((c = fgetc(f)) != EOF){
+      if (atlinestart && c == '+'){
+	while ((c = fgetc(f)) != EOF && c != '\n')  /* consume separator line */
+	  ;
+	break;
+      }
+      if (c == '\n' || c == '\r'){
+	atlinestart = 1;
+	continue;
+      }
+      atlinestart = 0;
+      if (isspace(c))
+	continue;
+      if (slen + 1 >= scap){
+	scap = scap ? scap * 2 : 256;
+	seq = (char *) realloc(seq, scap);
+      }
+      seq[slen++] = c;
     }
-    if (isspace(c))
-      continue;
-    if (slen + 1 >= scap){
-      scap = scap ? scap * 2 : 256;
-      seq = (char *) realloc(seq, scap);
-    }
-    seq[slen++] = c;
+    /* discard exactly slen quality characters (whitespace does not count) */
+    int q = 0;
+    while (q < slen && (c = fgetc(f)) != EOF)
+      if (!isspace(c))
+	q++;
   }
+  else{
+    /* FASTA sequence: everything up to the next '>' or EOF, whitespace removed */
+    while ((c = fgetc(f)) != EOF){
+      if (c == '>'){
+	ungetc(c, f);
+	break;
+      }
+      if (isspace(c))
+	continue;
+      if (slen + 1 >= scap){
+	scap = scap ? scap * 2 : 256;
+	seq = (char *) realloc(seq, scap);
+      }
+      seq[slen++] = c;
+    }
+  }
+
   if (seq == NULL)
     seq = (char *) malloc(1);
   seq[slen] = 0;
@@ -711,13 +775,69 @@ int readFastaRecord(FILE *f, char **name_out, char **seq_out){
   return 1;
 }
 
+/* Interleaved FASTQ counterpart of readSingleFasta: the forward and reverse
+   mate of each pair are in one file, paired by matching clone name (via the
+   hash table), exactly as in the FASTA path. */
+int readInterleavedFastq(FILE *f, int hashtype){
+  int clonecnt = 0;
+  int done = 0;
+  char *name, *seq;
+
+  /* first pass: count records so the hash table can be sized */
+  rewind(f);
+  while (readSeqRecord(f, FASTQ_FMT, &name, &seq)){
+    free(name); free(seq);
+    clonecnt++;
+  }
+
+  fprintf(stderr, "Allocating memory for %d sequences.\n", clonecnt);
+  forwards = (char **) calloc(clonecnt, sizeof(char *));
+  reverses = (char **) calloc(clonecnt, sizeof(char *));
+  names    = (char **) calloc(clonecnt, sizeof(char *));
+
+  /* second pass: store forward/reverse ends keyed by the clone's hash */
+  fprintf(stderr, "Reading sequences.\n");
+  rewind(f);
+  while (readSeqRecord(f, FASTQ_FMT, &name, &seq)){
+    char *clone = (char *) malloc(strlen(name) + 1);
+    int index;
+
+    end2clone(clone, name);
+    index = hash(clone, clonecnt, hashtype);
+
+    fprintf(stderr, "\r%d\tof\t%d", (done + 1), clonecnt);
+
+    if (names[index] == NULL){
+      names[index] = (char *) malloc(strlen(clone) + 1);
+      strcpy(names[index], clone);
+    }
+
+    if (isReverse(name)){
+      reverses[index] = (char *) malloc(strlen(seq) + 1);
+      rcomp(seq, reverses[index]);
+    }
+    else{
+      forwards[index] = (char *) malloc(strlen(seq) + 1);
+      strcpy(forwards[index], seq);
+    }
+
+    free(clone); free(name); free(seq);
+    done++;
+  }
+
+  fprintf(stderr, "\n[OK] %d sequences read from fastq file.\n", clonecnt);
+  return clonecnt;
+}
+
 /* Two-file input: forward reads in one file, reverse reads in another, paired
    by position (the i-th record of each file form a forward/reverse pair, so no
-   name matching is needed). Fills the global forwards/reverses/names arrays and
-   returns the number of pairs. Reverse reads are reverse-complemented, matching
-   how readSingleFasta stores them. */
-int readPairedFasta(FILE *fwd, FILE *rev){
+   name matching is needed). Each file's format (FASTA or FASTQ) is detected
+   independently. Fills the global forwards/reverses/names arrays and returns
+   the number of pairs. Reverse reads are reverse-complemented, matching how
+   readSingleFasta stores them. */
+int readPaired(FILE *fwd, FILE *rev){
   int cap = 0, n = 0;
+  int fwdfmt, revfmt;
   char *fwdname, *fwdseq;
   char *revname, *revseq;
 
@@ -725,13 +845,16 @@ int readPairedFasta(FILE *fwd, FILE *rev){
   reverses = NULL;
   names = NULL;
 
+  fwdfmt = detectFormat(fwd);
+  revfmt = detectFormat(rev);
+
   fprintf(stderr, "Reading paired forward/reverse sequences.\n");
 
-  while (readFastaRecord(fwd, &fwdname, &fwdseq)){
+  while (readSeqRecord(fwd, fwdfmt, &fwdname, &fwdseq)){
     char *clone;
     char *revcomp;
 
-    if (!readFastaRecord(rev, &revname, &revseq)){
+    if (!readSeqRecord(rev, revfmt, &revname, &revseq)){
       fprintf(stderr,
 	      "Warning: forward file has more reads than reverse; extra forward reads ignored.\n");
       free(fwdname); free(fwdseq);
@@ -767,7 +890,7 @@ int readPairedFasta(FILE *fwd, FILE *rev){
   }
 
   /* drain any leftover reverse reads just to report the mismatch */
-  if (readFastaRecord(rev, &revname, &revseq)){
+  if (readSeqRecord(rev, revfmt, &revname, &revseq)){
     fprintf(stderr,
 	    "\nWarning: reverse file has more reads than forward; extra reverse reads ignored.\n");
     free(revname); free(revseq);
@@ -783,10 +906,11 @@ void usage(char *prog){
 "\n"
 "Usage: %s [options]\n"
 "\n"
-"Input (choose one):\n"
-"  -i, --input FILE         interleaved FASTA (forward/reverse reads in one file)\n"
-"  -f, --forward FILE       forward reads FASTA (use together with --reverse)\n"
-"  -r, --reverse FILE       reverse reads FASTA (paired by position with --forward)\n"
+"Input (choose one). FASTA and FASTQ are both accepted and auto-detected\n"
+"from the first character ('>' = FASTA, '@' = FASTQ):\n"
+"  -i, --input FILE         interleaved reads (forward/reverse in one file)\n"
+"  -f, --forward FILE       forward reads (use together with --reverse)\n"
+"  -r, --reverse FILE       reverse reads (paired by position with --forward)\n"
 "\n"
 "Parameters:\n"
 "  -H, --hash N             hash function type (default 11)\n"
